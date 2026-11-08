@@ -1,0 +1,6 @@
+{
+  "name": "Du Lịch Vĩnh Long Thông Minh",
+  "description": "Smart Tourism Website with AI Voice Guide - Khám phá lịch sử, văn hóa, sinh thái Vĩnh Long với trợ lý thuyết minh giọng nói AI và góc học tập giáo dục địa phương.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
