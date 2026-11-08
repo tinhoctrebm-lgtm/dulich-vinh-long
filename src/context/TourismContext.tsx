@@ -152,7 +152,7 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const currentSentenceIdxRef = useRef<number>(0);
   const isCancelledRef = useRef<boolean>(false);
 
-  // Sync with backend API on mount if available
+  // Sync with backend API on mount if available & verify admin token
   useEffect(() => {
     fetch('/api/locations')
       .then(res => res.json())
@@ -165,6 +165,25 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
       .catch(() => {
         // Silently use localStorage fallback for offline / static mode
       });
+
+    // Validate admin token cryptographic signature and expiration with server
+    if (adminUser?.token) {
+      fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: adminUser.token }),
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (!data?.valid) {
+            console.warn('Phiên đăng nhập quản trị viên đã hết hạn hoặc không hợp lệ.');
+            logoutAdmin();
+          }
+        })
+        .catch(() => {
+          // ignore network transient errors on verify
+        });
+    }
   }, []);
 
   // Listen to hash changes (for QR codes and direct links e.g. #/place/ao-ba-om, #/admin/login)
@@ -239,7 +258,7 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
     if (adminUser?.token) {
       try {
-        await fetch('/api/locations', {
+        const res = await fetch('/api/locations', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -247,8 +266,17 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
           },
           body: JSON.stringify({ locations: newLocations }),
         });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.warn('[CMS Sync] Máy chủ từ chối cập nhật:', errData.error || res.statusText);
+          if (res.status === 401 || res.status === 403) {
+            // Token has expired or is invalid
+            logoutAdmin();
+          }
+        }
       } catch (err) {
-        console.warn('Lưu API server không thành công, dữ liệu đã được lưu an toàn tại localStorage:', err);
+        console.warn('[CMS Sync] Không thể kết nối tới API server:', err);
       }
     }
   };
@@ -266,7 +294,7 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return `VL-${catPrefix || 'LOC'}-${cleanName || 'SITE'}-${randomSuffix}`;
   };
 
-  // Login handler
+  // Login handler strictly verified by backend server
   const loginAdmin = async (username: string, password: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const res = await fetch('/api/auth/login', {
@@ -275,7 +303,8 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+
       if (res.ok && data.success && data.token) {
         const userObj: AdminUser = {
           username: data.user.username,
@@ -288,23 +317,16 @@ export const TourismProvider: React.FC<{ children: React.ReactNode }> = ({ child
         localStorage.setItem(STORAGE_KEY_AUTH, JSON.stringify(userObj));
         return { success: true };
       } else {
-        return { success: false, error: data.error || 'Đăng nhập không thành công.' };
-      }
-    } catch (e) {
-      // Local fallback check if server API is unavailable
-      if (username === 'admin' && (password === 'vinhlong2026' || password === 'admin')) {
-        const userObj: AdminUser = {
-          username: 'admin',
-          fullName: 'Quản trị viên Hệ thống Du Lịch Vĩnh Long (Offline Mode)',
-          role: 'admin',
-          token: 'vl_adm_token_local_' + Date.now(),
-          loginAt: new Date().toISOString(),
+        return { 
+          success: false, 
+          error: data.error || 'Tên đăng nhập hoặc mật khẩu không chính xác.' 
         };
-        setAdminUser(userObj);
-        localStorage.setItem(STORAGE_KEY_AUTH, JSON.stringify(userObj));
-        return { success: true };
       }
-      return { success: false, error: 'Tên đăng nhập hoặc mật khẩu không chính xác.' };
+    } catch {
+      return { 
+        success: false, 
+        error: 'Không thể kết nối đến máy chủ xác thực. Vui lòng kiểm tra lại trạng thái máy chủ.' 
+      };
     }
   };
 

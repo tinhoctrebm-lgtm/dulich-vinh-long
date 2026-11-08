@@ -4,7 +4,7 @@ import { Lock, Shield, Eye, EyeOff, LogIn, ArrowLeft, AlertCircle, CheckCircle2 
 
 export const AdminLogin: React.FC = () => {
   const { loginAdmin, setActiveTab } = useTourism();
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
@@ -20,7 +20,7 @@ export const AdminLogin: React.FC = () => {
       if (!result.success) {
         setError(result.error || 'Tên đăng nhập hoặc mật khẩu không chính xác.');
       }
-    } catch (err: any) {
+    } catch {
       setError('Đã xảy ra lỗi khi kết nối máy chủ xác thực.');
     } finally {
       setLoading(false);
@@ -54,17 +54,14 @@ export const AdminLogin: React.FC = () => {
         </div>
 
         {/* Security Role Notice */}
-        <div className="p-3.5 mb-6 bg-emerald-50/70 border border-emerald-200 rounded-2xl text-xs text-emerald-950 space-y-1">
+        <div className="p-4 mb-6 bg-stone-50 border border-stone-200 rounded-2xl text-xs text-stone-700 space-y-2">
           <div className="font-semibold flex items-center gap-1.5 text-emerald-800">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-            Hệ thống phân quyền an toàn (RBAC):
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            Bảo mật phân quyền máy chủ (RBAC & HMAC):
           </div>
-          <p className="text-[11px] leading-relaxed text-emerald-900">
-            Khách tham quan chỉ được xem dữ liệu công khai. Chỉ tài khoản Quản trị viên sau khi xác thực thành công mới có quyền thêm không giới hạn địa điểm, biên tập kịch bản thuyết minh và xuất/sao lưu dữ liệu.
+          <p className="text-[11px] leading-relaxed text-stone-600">
+            Khách tham quan chỉ có quyền xem dữ liệu công khai. Quyền Quản trị viên chỉ được cấp khi xác thực đúng tài khoản được cấu hình trong biến môi trường máy chủ và có chữ ký số HMAC-SHA256 hợp lệ.
           </p>
-          <div className="pt-1.5 border-t border-emerald-200/60 font-mono text-[11px] text-emerald-800">
-            Tài khoản thử nghiệm: <strong>admin</strong> / Mật khẩu: <strong>vinhlong2026</strong>
-          </div>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -76,7 +73,7 @@ export const AdminLogin: React.FC = () => {
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="admin"
+              placeholder="Nhập tên tài khoản quản trị"
               className="w-full px-4 py-3 bg-stone-50 border border-stone-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
               required
             />

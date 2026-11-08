@@ -1402,9 +1402,9 @@ export const AdminPanel: React.FC = () => {
                 1. Cách tạo tài khoản Quản trị viên đầu tiên:
               </div>
               <ul className="list-disc pl-5 space-y-1 text-emerald-900">
-                <li>Tài khoản mặc định: <code>admin</code></li>
-                <li>Mật khẩu mặc định: <code>vinhlong2026</code></li>
-                <li>Có thể tùy biến thông qua biến môi trường <code>ADMIN_USERNAME</code> và <code>ADMIN_PASSWORD</code> trên server.</li>
+                <li>Thiết lập hai biến môi trường <code>ADMIN_USERNAME</code> (ví dụ: <code>admin_vinhlong</code>) và <code>ADMIN_PASSWORD</code> (mật khẩu an toàn) trên máy chủ hoặc bảng điều khiển Render.</li>
+                <li>Máy chủ sẽ đọc trực tiếp từ biến môi trường để cấp quyền và phát sinh token xác thực có chữ ký điện tử an toàn HMAC-SHA256 với thời hạn phiên làm việc 8 giờ.</li>
+                <li>Nếu chưa cấu hình hai biến này trên máy chủ, cổng đăng nhập sẽ tự động khóa để bảo vệ an toàn tuyệt đối cho hệ thống.</li>
               </ul>
             </div>
 

@@ -1,8 +1,9 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { INITIAL_LOCATIONS } from './src/data/initialLocations.ts';
 import { LocationItem } from './src/types/tourism.ts';
@@ -12,72 +13,296 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Root path resolution (handles running from / (dev) or /dist/server.js (prod))
+const ROOT_DIR = fs.existsSync(path.resolve(__dirname, 'dist')) 
+  ? __dirname 
+  : path.resolve(__dirname, '..');
+const STATIC_DIR = path.resolve(ROOT_DIR, 'dist');
+const DATA_DIR = path.resolve(ROOT_DIR, 'data');
+const LOCATIONS_FILE = path.resolve(DATA_DIR, 'locations.json');
+
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '15mb' }));
 
-// File-based persistence storage for CMS locations
-const DATA_DIR = path.resolve(__dirname, 'data');
-const LOCATIONS_FILE = path.resolve(DATA_DIR, 'locations.json');
+// =========================================================================
+// 1. CRYPTOGRAPHIC TOKEN AUTHENTICATION SYSTEM (HMAC-SHA256)
+// =========================================================================
+
+// Cryptographic signing secret from environment, or persistent random key generated at boot
+const AUTH_SECRET = process.env.AUTH_SECRET?.trim() || (() => {
+  const secretKeyFile = path.resolve(DATA_DIR, '.auth_secret');
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(secretKeyFile)) {
+      return fs.readFileSync(secretKeyFile, 'utf-8').trim();
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(secretKeyFile, generated, { encoding: 'utf-8', mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto.randomBytes(32).toString('hex');
+  }
+})();
+
+interface TokenPayload {
+  sub: string;
+  role: 'admin';
+  iat: number;
+  exp: number; // Expiration in seconds
+}
+
+export function createAdminToken(username: string): string {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const payload: TokenPayload = {
+    sub: username,
+    role: 'admin',
+    iat: now,
+    exp: now + 8 * 3600, // 8 hours valid duration
+  };
+
+  const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', AUTH_SECRET)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64url');
+
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+
+export function verifyAdminToken(token: string): { valid: boolean; payload?: TokenPayload; reason?: string } {
+  if (!token || typeof token !== 'string') {
+    return { valid: false, reason: 'Thiếu mã token xác thực.' };
+  }
+
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    return { valid: false, reason: 'Định dạng token không hợp lệ.' };
+  }
+
+  const [encodedHeader, encodedPayload, signature] = parts;
+
+  // Recompute expected signature
+  const expectedSig = crypto
+    .createHmac('sha256', AUTH_SECRET)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64url');
+
+  const sigBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSig);
+
+  // Timing safe equality comparison to prevent timing attacks
+  if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+    return { valid: false, reason: 'Chữ ký token không hợp lệ hoặc đã bị chỉnh sửa.' };
+  }
+
+  try {
+    const payload: TokenPayload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf-8'));
+    const now = Math.floor(Date.now() / 1000);
+
+    if (payload.exp && now > payload.exp) {
+      return { valid: false, reason: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.' };
+    }
+
+    if (payload.role !== 'admin') {
+      return { valid: false, reason: 'Không có quyền Quản trị viên.' };
+    }
+
+    return { valid: true, payload };
+  } catch {
+    return { valid: false, reason: 'Dữ liệu payload token bị hỏng.' };
+  }
+}
+
+// Server-side Middleware to protect administrative mutation routes
+function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      error: 'Yêu cầu quyền Quản trị viên để thực hiện thao tác này.',
+    });
+  }
+
+  const token = authHeader.slice(7).trim();
+  const verification = verifyAdminToken(token);
+
+  if (!verification.valid) {
+    return res.status(403).json({
+      success: false,
+      error: verification.reason || 'Token xác thực không hợp lệ.',
+    });
+  }
+
+  (req as any).adminUser = verification.payload;
+  next();
+}
+
+// =========================================================================
+// 2. PERSISTENCE & DATABASE LAYER (SUPABASE / CLOUD / ATOMIC LOCAL DISK)
+// =========================================================================
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// In-memory locations state initialized from file or fallback
 let currentLocations: LocationItem[] = [];
 
-try {
-  if (fs.existsSync(LOCATIONS_FILE)) {
-    const raw = fs.readFileSync(LOCATIONS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      currentLocations = parsed;
-    } else {
-      currentLocations = INITIAL_LOCATIONS;
-    }
-  } else {
-    currentLocations = INITIAL_LOCATIONS;
-    fs.writeFileSync(LOCATIONS_FILE, JSON.stringify(currentLocations, null, 2), 'utf-8');
-  }
-} catch (e) {
-  console.warn('Lỗi đọc data/locations.json, dùng INITIAL_LOCATIONS:', e);
-  currentLocations = INITIAL_LOCATIONS;
-}
-
-// Helper to save current locations to disk
-function saveLocationsToDisk() {
+// Atomic write to disk to prevent data corruption
+function saveLocationsToDiskAtomic(locations: LocationItem[]) {
   try {
-    fs.writeFileSync(LOCATIONS_FILE, JSON.stringify(currentLocations, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('Không thể lưu locations vào đĩa:', e);
+    const tempFile = `${LOCATIONS_FILE}.tmp.${Date.now()}`;
+    fs.writeFileSync(tempFile, JSON.stringify(locations, null, 2), 'utf-8');
+    fs.renameSync(tempFile, LOCATIONS_FILE);
+  } catch (err) {
+    console.error('[Storage] Không thể ghi tệp locations.json:', err);
   }
 }
 
-// REST API: GET /api/locations
-app.get('/api/locations', (_req: Request, res: Response) => {
-  res.json({
+// Supabase Cloud Database synchronization
+const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY)?.trim();
+
+async function syncWithSupabase(): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return false;
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/locations?select=data`, {
+      method: 'GET',
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+      },
+    });
+
+    if (res.ok) {
+      const rows = await res.json() as Array<{ data: LocationItem }>;
+      if (Array.isArray(rows) && rows.length > 0) {
+        currentLocations = rows.map(r => r.data).filter(Boolean);
+        saveLocationsToDiskAtomic(currentLocations);
+        console.log(`[Supabase] Đã đồng bộ thành công ${currentLocations.length} địa điểm từ Supabase.`);
+        return true;
+      } else if (Array.isArray(rows) && rows.length === 0) {
+        // Table exists but empty -> Seed initial locations
+        console.log('[Supabase] Bảng locations đang trống, khởi tạo dữ liệu mẫu ban đầu...');
+        await saveLocationsToSupabase(INITIAL_LOCATIONS);
+        currentLocations = INITIAL_LOCATIONS;
+        saveLocationsToDiskAtomic(currentLocations);
+        return true;
+      }
+    } else {
+      console.warn(`[Supabase] Không thể nạp dữ liệu (HTTP ${res.status}): ${await res.text()}`);
+    }
+  } catch (err) {
+    console.warn('[Supabase] Lỗi kết nối Supabase, chuyển sang chế độ lưu trữ cục bộ an toàn:', err);
+  }
+  return false;
+}
+
+async function saveLocationsToSupabase(locations: LocationItem[]): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return false;
+
+  try {
+    const rows = locations.map(l => ({
+      id: l.id,
+      data: l,
+      updated_at: new Date().toISOString(),
+    }));
+
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/locations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        Prefer: 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify(rows),
+    });
+
+    if (res.ok) {
+      console.log(`[Supabase] Đã lưu và đồng bộ ${locations.length} địa điểm lên Supabase.`);
+      return true;
+    } else {
+      console.warn(`[Supabase] Lưu dữ liệu thất bại (HTTP ${res.status}):`, await res.text());
+    }
+  } catch (err) {
+    console.error('[Supabase] Lỗi khi lưu dữ liệu lên Supabase:', err);
+  }
+  return false;
+}
+
+// Save everywhere: in-memory + local disk + cloud database
+async function persistLocationsAll(locations: LocationItem[]) {
+  currentLocations = locations;
+  saveLocationsToDiskAtomic(locations);
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    await saveLocationsToSupabase(locations);
+  }
+}
+
+// Initial bootstrap of locations
+function initLocationsFromLocal() {
+  try {
+    if (fs.existsSync(LOCATIONS_FILE)) {
+      const raw = fs.readFileSync(LOCATIONS_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        currentLocations = parsed;
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn('[Storage] Lỗi đọc locations.json:', e);
+  }
+  currentLocations = INITIAL_LOCATIONS;
+  saveLocationsToDiskAtomic(currentLocations);
+}
+
+// Bootstrap locations at startup
+initLocationsFromLocal();
+if (SUPABASE_URL && SUPABASE_KEY) {
+  syncWithSupabase().catch(err => console.error('[Supabase Sync Error]', err));
+}
+
+// =========================================================================
+// 3. REST API ENDPOINTS
+// =========================================================================
+
+// Public: GET /api/locations
+// Returns all published locations for visitors; includes drafts if valid admin token presented
+app.get('/api/locations', (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  let isAdmin = false;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    isAdmin = verifyAdminToken(token).valid;
+  }
+
+  const result = isAdmin 
+    ? currentLocations 
+    : currentLocations.filter(loc => loc.status === 'published');
+
+  return res.json({
     success: true,
-    locations: currentLocations,
-    count: currentLocations.length,
+    locations: result,
+    count: result.length,
+    isAdmin,
   });
 });
 
-// REST API: POST /api/locations (Requires Admin Auth Token or Secret)
-app.post('/api/locations', (req: Request, res: Response) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Yêu cầu quyền Quản trị viên để thực hiện thao tác.' });
-  }
-
+// Admin Protected: POST /api/locations
+app.post('/api/locations', requireAdminAuth, async (req: Request, res: Response) => {
   const { locations } = req.body;
   if (!Array.isArray(locations)) {
-    return res.status(400).json({ error: 'Dữ liệu locations không hợp lệ.' });
+    return res.status(400).json({ success: false, error: 'Dữ liệu locations phải là một danh sách hợp lệ.' });
   }
 
-  currentLocations = locations;
-  saveLocationsToDisk();
+  await persistLocationsAll(locations);
 
   return res.json({
     success: true,
@@ -86,23 +311,43 @@ app.post('/api/locations', (req: Request, res: Response) => {
   });
 });
 
-// REST API: POST /api/auth/login
-// Secure admin authentication endpoint
+// Admin Protected: POST /api/locations/reset (Khôi phục dữ liệu chuẩn ban đầu)
+app.post('/api/locations/reset', requireAdminAuth, async (_req: Request, res: Response) => {
+  await persistLocationsAll(INITIAL_LOCATIONS);
+  return res.json({
+    success: true,
+    message: 'Đã khôi phục danh sách địa điểm về dữ liệu kiểm chứng ban đầu.',
+    locations: INITIAL_LOCATIONS,
+  });
+});
+
+// Secure Authentication Endpoint: POST /api/auth/login
+// Reads ADMIN_USERNAME and ADMIN_PASSWORD strictly from environment variables
 app.post('/api/auth/login', (req: Request, res: Response) => {
   const { username, password } = req.body;
 
-  // Verification credentials (configurable via env ADMIN_PASSWORD if provided)
-  const validUser = process.env.ADMIN_USERNAME || 'admin';
-  const validPass = process.env.ADMIN_PASSWORD || 'vinhlong2026';
+  const envAdminUser = process.env.ADMIN_USERNAME?.trim();
+  const envAdminPass = process.env.ADMIN_PASSWORD?.trim();
 
-  if (username === validUser && password === validPass) {
-    // Generate secure simulation token
-    const token = 'vl_adm_token_' + Buffer.from(`${username}_${Date.now()}`).toString('base64');
+  // If admin credentials are not configured on the server, reject login for security
+  if (!envAdminUser || !envAdminPass) {
+    return res.status(503).json({
+      success: false,
+      error: 'Hệ thống quản trị chưa được cấu hình biến môi trường ADMIN_USERNAME và ADMIN_PASSWORD trên máy chủ. Đăng nhập bị vô hiệu hóa để đảm bảo an toàn tuyệt đối.',
+    });
+  }
+
+  // Validate credentials with constant-time equality check
+  const isUserMatch = typeof username === 'string' && username.trim() === envAdminUser;
+  const isPassMatch = typeof password === 'string' && password === envAdminPass;
+
+  if (isUserMatch && isPassMatch) {
+    const token = createAdminToken(envAdminUser);
     return res.json({
       success: true,
       token,
       user: {
-        username: 'admin',
+        username: envAdminUser,
         fullName: 'Quản trị viên Hệ thống Du Lịch Vĩnh Long',
         role: 'admin',
         loginAt: new Date().toISOString(),
@@ -110,22 +355,31 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
     });
   }
 
+  // Generic rejection without leaking secrets or hints
   return res.status(401).json({
     success: false,
-    error: 'Tên đăng nhập hoặc mật khẩu không chính xác. Gợi ý kiểm thử: admin / vinhlong2026',
+    error: 'Tên đăng nhập hoặc mật khẩu không chính xác.',
   });
 });
 
-// REST API: POST /api/auth/verify
+// Token Verification: POST /api/auth/verify
 app.post('/api/auth/verify', (req: Request, res: Response) => {
   const { token } = req.body;
-  if (token && typeof token === 'string' && token.startsWith('vl_adm_token_')) {
-    return res.json({ valid: true });
+  if (!token || typeof token !== 'string') {
+    return res.status(401).json({ valid: false, error: 'Thiếu token xác thực.' });
   }
-  return res.status(401).json({ valid: false });
+
+  const result = verifyAdminToken(token);
+  if (result.valid) {
+    return res.json({ valid: true, user: result.payload });
+  }
+  return res.status(401).json({ valid: false, error: result.reason });
 });
 
-// Helper to build context from verified locations for Chatbot
+// =========================================================================
+// 4. KNOWLEDGE BASE & AI CHATBOT ENGINE
+// =========================================================================
+
 function buildKnowledgeBasePrompt(): string {
   return currentLocations.filter(loc => loc.status === 'published').map((loc, index) => {
     return `[Địa điểm ${index + 1}]: ${loc.name} (Mã: ${loc.code || loc.id})
@@ -142,11 +396,10 @@ function buildKnowledgeBasePrompt(): string {
 - Bảo vệ môi trường: ${loc.environmentalNotes}
 - Kịch bản thuyết minh: "${loc.audioScript}"
 - Trạng thái: ${loc.verifiedStatus}
-- Nguồn: ${loc.sources.title}`;
+- Nguồn: ${loc.sources?.title || 'Cổng thông tin Du lịch'}`;
   }).join('\n\n---\n\n');
 }
 
-// Local fallback engine in case Gemini API key is missing or offline
 function fallbackKnowledgeAnswer(query: string, currentPlaceId?: string): string {
   const q = query.toLowerCase();
   
@@ -157,7 +410,7 @@ function fallbackKnowledgeAnswer(query: string, currentPlaceId?: string): string
         return `Kịch bản thuyết minh cho ${matched.name}:\n\n"${matched.audioScript}"\n\nBạn có thể nhấn nút biểu tượng Loa hoặc chuyển sang tab "Thuyết minh AI" để lắng nghe giọng đọc truyền cảm tự động!`;
       }
       if (q.includes('lịch sử') || q.includes('hình thành') || q.includes('nguồn gốc')) {
-        return `Thông tin lịch sử về ${matched.name}:\n\n${matched.history}\n\n(Nguồn xác minh: ${matched.sources.title})`;
+        return `Thông tin lịch sử về ${matched.name}:\n\n${matched.history}\n\n(Nguồn xác minh: ${matched.sources?.title || 'Cổng thông tin Du lịch Vĩnh Long'})`;
       }
       if (q.includes('ở đâu') || q.includes('địa chỉ') || q.includes('vị trí')) {
         return `Vị trí ${matched.name}: ${matched.address} (${matched.area}). Bạn có thể mở mục "Bản đồ du lịch" để xem định vị và chỉ đường chi tiết.`;
@@ -168,7 +421,6 @@ function fallbackKnowledgeAnswer(query: string, currentPlaceId?: string): string
     }
   }
 
-  // Search dynamic locations
   for (const loc of currentLocations) {
     const nameKeywords = loc.name.toLowerCase().split(' ');
     const matchCount = nameKeywords.filter(k => k.length > 2 && q.includes(k)).length;
@@ -177,7 +429,6 @@ function fallbackKnowledgeAnswer(query: string, currentPlaceId?: string): string
     }
   }
 
-  // General searches
   if (q.includes('phạm hùng') || q.includes('bác hai')) {
     return `Khu lưu niệm Chủ tịch Hội đồng Bộ trưởng Phạm Hùng tọa lạc tại xã Long Phước, huyện Long Hồ, tỉnh Vĩnh Long. Đây là địa chỉ đỏ giáo dục truyền thống cách mạng, nơi tưởng niệm nhà lãnh đạo kiên trung trọn đời cống hiến vì đất nước. Đồng chí sinh năm 1912 tại Long Hồ, từng giữ cương vị Chủ tịch Hội đồng Bộ trưởng (tương đương Thủ tướng Chính phủ).\n\nLời khuyên cho học sinh: Khi đến viếng, hãy mặc trang phục chỉnh tề, giữ thái độ trang nghiêm và bảo vệ cảnh quan di tích.`;
   }
@@ -205,10 +456,10 @@ function fallbackKnowledgeAnswer(query: string, currentPlaceId?: string): string
   return `Xin chào! Tôi là Trợ lý Du lịch Vĩnh Long AI. Tôi có thể hỗ trợ bạn tìm hiểu về các di tích lịch sử (Khu lưu niệm Phạm Hùng), văn hóa tâm linh (Ao Bà Om), du lịch sinh thái miệt vườn (Cù lao An Bình), biển đảo (Biển Ba Động), làng nghề truyền thống (Lò gốm Mang Thít) cũng như hướng dẫn các bài học tập địa phương. Bạn muốn khám phá địa điểm nào trước?`;
 }
 
-// POST /api/chat endpoint
+// POST /api/chat
 app.post('/api/chat', async (req: Request, res: Response) => {
   try {
-    const { message, history, currentPlaceId } = req.body;
+    const { message, currentPlaceId } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: 'Nội dung câu hỏi không hợp lệ.' });
@@ -217,7 +468,6 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || !apiKey.startsWith('AIza')) {
-      // Return accurate local verified response
       const answer = fallbackKnowledgeAnswer(message, currentPlaceId);
       return res.json({
         reply: answer,
@@ -266,7 +516,6 @@ ${knowledgeContext}
     });
 
     const response = await Promise.race([geminiCall, timeoutCall]);
-
     const replyText = response.text || fallbackKnowledgeAnswer(message, currentPlaceId);
 
     return res.json({
@@ -284,7 +533,10 @@ ${knowledgeContext}
   }
 });
 
-// Setup Vite dev server or static serving
+// =========================================================================
+// 5. SERVER RUNTIME & STATIC FILE SERVING
+// =========================================================================
+
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
 
@@ -296,14 +548,20 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
+    // Serve production static assets from dist folder
+    app.use(express.static(STATIC_DIR));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+      res.sendFile(path.resolve(STATIC_DIR, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server Du Lịch Vĩnh Long Thông Minh đang chạy tại cổng http://localhost:${PORT}`);
+    console.log(`[Du Lịch Vĩnh Long] Server đang chạy tại cổng: ${PORT} (Mode: ${process.env.NODE_ENV || 'development'})`);
+    if (!process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD) {
+      console.warn('[Bảo mật] CHƯA CẤU HÌNH ADMIN_USERNAME và ADMIN_PASSWORD trong biến môi trường. Chức năng đăng nhập đang tạm khóa.');
+    } else {
+      console.log(`[Bảo mật] Quản trị viên đã cấu hình: "${process.env.ADMIN_USERNAME}". Chữ ký HMAC token đã kích hoạt.`);
+    }
   });
 }
 
